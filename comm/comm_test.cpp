@@ -240,7 +240,7 @@ void perf_NetAllGather(std::shared_ptr<mscclpp::Communicator> comm,
                   << "nblocks=" << nblocks << ",nthreads=" << nthreads
                   << ",buff_size=" << buff_size << ",inplace=" << inplace
                   << ") finished: time=" << avg_time * 1e3 << "us " 
-                  << "algbw=" << algbw << "Gbps" << std::endl;
+                  << "algbw=" << algbw << "GBps" << std::endl;
     }
 }
 
@@ -296,7 +296,7 @@ void perf_NetReduceScatter(std::shared_ptr<mscclpp::Communicator> comm,
                   << "nblocks=" << nblocks << ",nthreads=" << nthreads
                   << ",buff_size=" << buff_size << ",inplace=" << inplace
                   << ") finished: time=" << avg_time * 1e3 << "us " 
-                  << "algbw=" << algbw << "Gbps" << std::endl;
+                  << "algbw=" << algbw << "GBps" << std::endl;
     }
 }
 

@@ -5,6 +5,8 @@
 
 #include "netWrapper.cuh"
 
+#include <hip/hip_runtime.h>
+
 void test_NetAllGather(std::shared_ptr<mscclpp::Communicator> comm,
                        std::vector<std::shared_ptr<mscclpp::Connection>>& connections,
                        const int rank, const int nranks,
@@ -184,6 +186,120 @@ void test_NetAllReduce(std::shared_ptr<mscclpp::Communicator> comm,
               << ") finished" << std::endl;
 }
 
+void perf_NetAllGather(std::shared_ptr<mscclpp::Communicator> comm,
+                       std::vector<std::shared_ptr<mscclpp::Connection>>& connections,
+                       const int rank, const int nranks,
+                       const size_t buff_size, const bool inplace,
+                       const int nblocks, const int nthreads,
+                       const int warmup_iters, const int perf_iters) {
+    // Intialize host and device buffers
+    std::vector<__fp16> host_buff(buff_size / sizeof(__fp16));
+    for (size_t i = 0; i < host_buff.size(); ++i) host_buff[i] = __fp16(int((i * rank) % 101));
+    void* input_buff;
+    CUDA_CHECK(cudaMalloc(&input_buff, buff_size));
+    CUDA_CHECK(cudaMemcpy(input_buff, host_buff.data(), buff_size, cudaMemcpyHostToDevice));
+    void* output_buff;
+    if (inplace) {
+        output_buff = input_buff;
+    } else {
+        CUDA_CHECK(cudaMalloc(&output_buff, buff_size));
+    }
+
+    int dim1 = buff_size / sizeof(__fp16);
+
+    // Initialize NetWrapper
+    NetAllGather wrapper;
+    wrapper.init(
+        comm, connections, rank, nranks,
+        pllmTensor<half>{(half*)input_buff, dim1, 1, PllmLayout::ROW_MAJOR},
+        pllmTensor<half>{(half*)output_buff, dim1, 1, PllmLayout::ROW_MAJOR});
+
+    hipEvent_t start_event, end_event;
+    CUDA_CHECK(hipEventCreate(&start_event));
+    CUDA_CHECK(hipEventCreate(&end_event));
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    for (int i = 0; i < warmup_iters; ++i) wrapper(0, nblocks, nthreads, true);
+    CUDA_CHECK(hipEventRecord(start_event));
+    for (int i = 0; i < perf_iters; ++i) wrapper(0, nblocks, nthreads, true);
+    CUDA_CHECK(hipEventRecord(end_event));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    float elapsed_time;
+    CUDA_CHECK(hipEventElapsedTime(&elapsed_time, start_event, end_event));
+    double avg_time = (double) elapsed_time / perf_iters;
+    double algbw = (double) buff_size / (avg_time * 1e-3) / 1e9;
+
+    CUDA_CHECK(cudaFree(input_buff));
+    if (input_buff != output_buff) CUDA_CHECK(cudaFree(output_buff));
+    CUDA_CHECK(hipEventDestroy(start_event));
+    CUDA_CHECK(hipEventDestroy(end_event));
+    if (rank == 0) {
+        std::cout << "Rank " << rank << " NetAllGather perf ("
+                  << "nblocks=" << nblocks << ",nthreads=" << nthreads
+                  << ",buff_size=" << buff_size << ",inplace=" << inplace
+                  << ") finished: time=" << avg_time * 1e3 << "us " 
+                  << "algbw=" << algbw << "Gbps" << std::endl;
+    }
+}
+
+void perf_NetReduceScatter(std::shared_ptr<mscclpp::Communicator> comm,
+                           std::vector<std::shared_ptr<mscclpp::Connection>>& connections,
+                           const int rank, const int nranks,
+                           const size_t buff_size, const bool inplace,
+                           const int nblocks, const int nthreads,
+                           const int warmup_iters, const int perf_iters) {
+    // Intialize host and device buffers
+    std::vector<__fp16> host_buff(buff_size / sizeof(__fp16));
+    for (size_t i = 0; i < host_buff.size(); ++i) host_buff[i] = __fp16(int((i * rank) % 101));
+    void* input_buff;
+    CUDA_CHECK(cudaMalloc(&input_buff, buff_size));
+    CUDA_CHECK(cudaMemcpy(input_buff, host_buff.data(), buff_size, cudaMemcpyHostToDevice));
+    void* output_buff;
+    if (inplace) {
+        output_buff = input_buff;
+    } else {
+        CUDA_CHECK(cudaMalloc(&output_buff, buff_size));
+    }
+
+    // Initialize NetWrapper
+    NetReduceScatter wrapper;
+    wrapper.init(
+        comm, connections, rank, nranks, 
+        (half*) input_buff, (half*) output_buff, 
+        (int) (buff_size / sizeof(half)), (int) (buff_size / sizeof(half)));
+
+    hipEvent_t start_event, end_event;
+    CUDA_CHECK(hipEventCreate(&start_event));
+    CUDA_CHECK(hipEventCreate(&end_event));
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    for (int i = 0; i < warmup_iters; ++i) wrapper(0, nblocks, nthreads, true);
+    CUDA_CHECK(hipEventRecord(start_event));
+    for (int i = 0; i < perf_iters; ++i) wrapper(0, nblocks, nthreads, true);
+    CUDA_CHECK(hipEventRecord(end_event));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    float elapsed_time;
+    CUDA_CHECK(hipEventElapsedTime(&elapsed_time, start_event, end_event));
+    double avg_time = (double) elapsed_time / perf_iters;
+    double algbw = (double) buff_size / (avg_time * 1e-3) / 1e9;
+
+    CUDA_CHECK(cudaFree(input_buff));
+    if (input_buff != output_buff) CUDA_CHECK(cudaFree(output_buff));
+    CUDA_CHECK(hipEventDestroy(start_event));
+    CUDA_CHECK(hipEventDestroy(end_event));
+    if (rank == 0) {
+        std::cout << "Rank " << rank << " NetReduceScatter perf ("
+                  << "nblocks=" << nblocks << ",nthreads=" << nthreads
+                  << ",buff_size=" << buff_size << ",inplace=" << inplace
+                  << ") finished: time=" << avg_time * 1e3 << "us " 
+                  << "algbw=" << algbw << "Gbps" << std::endl;
+    }
+}
+
 int main(int argc, char* argv[]) {
     // Initialize the MPI environment
     MPI_Init(&argc, &argv);
@@ -231,6 +347,19 @@ int main(int argc, char* argv[]) {
     test_NetReduceScatter(comm, connections, rank, nranks, buff_size, false);
     test_NetAllReduce(comm, connections, rank, nranks, buff_size, true);
     test_NetAllReduce(comm, connections, rank, nranks, buff_size, false);
+
+    // Performance
+    constexpr int warmup_iters = 10;
+    constexpr int perf_iters = 100;
+    constexpr size_t perf_buff_size = 1024 * 1024 * 1024;
+    for (int nblocks = 7; nblocks < 108; nblocks *= 2) {
+        perf_NetAllGather(comm, connections, rank, nranks, perf_buff_size, true,
+                          nblocks, 256, warmup_iters, perf_iters);
+    }
+    for (int nblocks = 7; nblocks < 108; nblocks *= 2) {
+        perf_NetReduceScatter(comm, connections, rank, nranks, perf_buff_size, true,
+                              nblocks, 256, warmup_iters, perf_iters);
+    }
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {

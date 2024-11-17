@@ -400,6 +400,94 @@ class NetAllReduceWithLN : public NetAllReduce
     }
 };
 
+class NetRingAllGather: public NetWrapper
+{
+    public:
+    mscclpp::DeviceSyncer* syncersCuda;
+    mscclpp::DeviceHandle<mscclpp::SmChannel> *smInputChannelHandlesCuda;
+    mscclpp::DeviceHandle<mscclpp::SmChannel> *smOutputChannelHandlesCuda;
+    int nrings;
+
+    NetRingAllGather():NetWrapper(){}
+
+    void init(std::shared_ptr<mscclpp::Communicator> comm,
+                    std::vector<std::shared_ptr<mscclpp::Connection>> connections,
+                    int rank, int nranks,
+                    pllmTensor<Element> input,
+                    pllmTensor<Element> output, int nrings, int *rank_to_send, int *rank_to_recv) {
+        NetWrapper::init(rank, nranks, input.ptr, output.ptr, input.size(), output.size());
+        std::vector<mscclpp::DeviceSyncer> syncers(1);
+        CUDA_CHECK(cudaMalloc(&syncersCuda, syncers.size() * sizeof(mscclpp::DeviceSyncer)));
+        CUDA_CHECK(cudaMemcpy(syncersCuda, syncers.data(), syncers.size() * sizeof(mscclpp::DeviceSyncer), cudaMemcpyHostToDevice));
+
+        setupSmChannels(comm, connections, &smInputChannelHandlesCuda, &smOutputChannelHandlesCuda, input.ptr, output.ptr, input.size(), output.size(), nrings, rank_to_send, rank_to_recv);
+    }
+
+    void setupSmChannels(std::shared_ptr<mscclpp::Communicator> comm,
+                         std::vector<std::shared_ptr<mscclpp::Connection>> connections,
+                         mscclpp::DeviceHandle<mscclpp::SmChannel>** smInputChannelHandlesCuda,
+                         mscclpp::DeviceHandle<mscclpp::SmChannel>** smOutputChannelHandlesCuda,
+                         Element* input, Element* output, size_t input_size, size_t output_size, 
+                         int nrings, int *rank_to_send, int *rank_to_recv) {
+        const mscclpp::TransportFlags allTransports = mscclpp::Transport::CudaIpc;
+        mscclpp::RegisteredMemory inputBuffRegMem = comm->registerMemory(input, input_size * sizeof(Element), allTransports);
+        mscclpp::RegisteredMemory outputBuffRegMem;
+        if (input != output) outputBuffRegMem = comm->registerMemory(output, output_size * sizeof(Element), allTransports);
+
+        std::vector<mscclpp::NonblockingFuture<mscclpp::RegisteredMemory>> remoteRegMemories;
+        mscclpp::RegisteredMemory& localRegMemory = (input != output) ? outputBuffRegMem : inputBuffRegMem;
+
+        std::vector<std::shared_ptr<mscclpp::SmDevice2DeviceSemaphore>> smSemaphores;
+        for (size_t i = 0; i < nrings; ++i) {
+            int conn_send_idx = rank_to_send[i] - (rank_to_send[i] > rank);
+            int conn_recv_idx = rank_to_recv[i] - (rank_to_recv[i] > rank);
+            comm->sendMemoryOnSetup(localRegMemory, rank_to_send[i], 0);
+            auto remoteMemory = comm->recvMemoryOnSetup(rank_to_send[i], 0);
+            remoteRegMemories.push_back(remoteMemory);
+            comm->sendMemoryOnSetup(localRegMemory, rank_to_recv[i], 0);
+            remoteMemory = comm->recvMemoryOnSetup(rank_to_recv[i], 0);
+            remoteRegMemories.push_back(remoteMemory);
+
+            smSemaphores.emplace_back(std::make_shared<mscclpp::SmDevice2DeviceSemaphore>(*comm, connections[conn_send_idx]));
+            smSemaphores.emplace_back(std::make_shared<mscclpp::SmDevice2DeviceSemaphore>(*comm, connections[conn_recv_idx]));
+        }
+        comm->setup();
+
+        for (size_t i = 0; i < nrings; ++i) {
+            smChannels.emplace_back(smSemaphores[2*i + 1], remoteRegMemories[2*i + 1].get(), localRegMemory.data());
+            smChannelHandles.emplace_back(mscclpp::deviceHandle(smChannels.back()));
+        }
+        comm->setup();
+
+        for (size_t i = 0; i < nrings; ++i) {
+            smChannels.emplace_back(smSemaphores[2*i], remoteRegMemories[2*i].get(), localRegMemory.data());
+            smChannelHandles.emplace_back(mscclpp::deviceHandle(smChannels.back()));
+        }
+        comm->setup();
+
+        CUDA_CHECK(cudaMalloc(smInputChannelHandlesCuda, sizeof(mscclpp::DeviceHandle<mscclpp::SmChannel>)));
+        CUDA_CHECK(cudaMemcpy(*smInputChannelHandlesCuda, &smChannelHandles[nrings],
+                              nrings * sizeof(mscclpp::DeviceHandle<mscclpp::SmChannel>), cudaMemcpyHostToDevice));
+                              
+        CUDA_CHECK(cudaMalloc(smOutputChannelHandlesCuda, sizeof(mscclpp::DeviceHandle<mscclpp::SmChannel>)));
+        CUDA_CHECK(cudaMemcpy(*smOutputChannelHandlesCuda, &smChannelHandles[0],
+                              nrings * sizeof(mscclpp::DeviceHandle<mscclpp::SmChannel>), cudaMemcpyHostToDevice));
+    }
+
+    void operator()(cudaStream_t stream, int nblocks, int nthreads, bool sync){
+        const uint64_t nelem_per_shard = input_size / nranks;
+        const uint64_t local_offset = rank * nelem_per_shard;
+        multiRingAllgatherKernel<<<nblocks, nthreads, 0, stream>>>(smInputChannelHandlesCuda, smOutputChannelHandlesCuda, syncersCuda, 1, rank, nranks, nelem_per_shard, input, output);
+    }
+
+
+    ~NetRingAllGather(){
+        CUDA_CHECK(cudaFree(syncersCuda));
+        CUDA_CHECK(cudaFree(smInputChannelHandlesCuda));
+        CUDA_CHECK(cudaFree(smOutputChannelHandlesCuda));
+    }
+};
+
 
 class NetAsyncWrapper: public NetWrapper
 {

@@ -124,3 +124,11 @@ void setupChannels(mscclpp::Communicator* comm,
 				   int nranks,
 				   void* buff,
 				   size_t buffBytes);
+
+extern "C" __global__ void
+    multiRingAllgatherKernel(mscclpp::SmChannelDeviceHandle* recv_sm_channels, // length = nrings
+                             mscclpp::SmChannelDeviceHandle* send_sm_channels, // length = nrings
+                             mscclpp::DeviceSyncer* syncers, // length = nrings
+                             const int nrings, const int rank, const int nranks,
+                             const uint64_t nelem_per_shard,
+                             half* input, half* output);

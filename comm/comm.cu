@@ -293,6 +293,188 @@ extern "C" __global__ void __launch_bounds__(1024)
     allgatherKernel(sm_output_buff_channels, syncers, nchannels, local_offset, nelem_per_shard, output, output);
 }
 
+// For each i, (gridDim.x / nrings) number of threadblocks recv from recv_sm_channels[i] and signal to send_sm_channels[i]
+// skip recv if recv_sm_channels[i].dst_ == NULL (first GPU in ring); skip signal if send_sm_channels[i].dst_ == NULL (last GPU in ring)
+extern "C" __global__ void
+    multiRingAllgatherKernel(mscclpp::SmChannelDeviceHandle* recv_sm_channels, // length = nrings
+                             mscclpp::SmChannelDeviceHandle* send_sm_channels, // length = nrings
+                             mscclpp::DeviceSyncer* syncers, // length = nrings
+                             const int nrings, const int rank, const int nranks,
+                             const uint64_t nelem_per_shard,
+                             half* input, half* output) {
+    
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+    const int threadId = tid + bid * blockDim.x;
+    const int block_per_ring = gridDim.x / nrings;
+    const int channel_id = bid / block_per_ring;
+    constexpr uint64_t n_half_per_int4 = sizeof(int4) / sizeof(half);
+    auto &&recv_channel = recv_sm_channels[channel_id];
+    auto &&send_channel = send_sm_channels[channel_id];
+
+
+    // if (threadId == 0)
+    //     printf("rank: %d, local_input: %f, local_output: %f\n", rank, *(float*)input, *(float*)output);
+    for (int broadcast_idx = 0; broadcast_idx < nranks; broadcast_idx++) {
+        // broadcast_idx = 0 means the local preparation iter
+
+        // if (recv_channel.dst_ != NULL) {
+        // if (broadcast_idx != 0) {
+        //     if (threadId % (blockDim.x * block_per_ring) == 0) {
+        //         recv_channel.wait();
+        //     }
+            syncers[channel_id].sync(block_per_ring);
+            const uint64_t local_offset = (rank + broadcast_idx + nranks) % nranks * nelem_per_shard;
+            const uint64_t local_offset4 = (local_offset + n_half_per_int4 - 1) / n_half_per_int4;
+            const uint64_t nFirstElem = local_offset4 * n_half_per_int4 - local_offset;
+            if (threadId < nFirstElem && threadId < nelem_per_shard) {
+                const uint64_t offset = local_offset + threadId;
+                // if (offset == 0)
+                //     printf("rank: %d, remote_value: %f\n", rank, (float) recv_channel.read<half>(offset));
+                if (broadcast_idx == 0) {
+                    if (output != input) output[offset] = input[offset];
+                }
+                else
+                    output[offset] = recv_channel.read<half>(offset);
+            }
+
+            int4* input4 = &reinterpret_cast<int4*>(input)[local_offset4];
+            int4* output4 = &reinterpret_cast<int4*>(output)[local_offset4];
+            const uint64_t nelem4 = (nelem_per_shard - nFirstElem) / n_half_per_int4;
+            for (uint64_t offset = threadId; offset < nelem4; offset += block_per_ring * blockDim.x) {
+                
+                // if (local_offset4 + offset == 0)
+                //     printf("rank: %d,  remote_value: %f\n", rank, (float) recv_channel.read<half>(local_offset4 + offset));
+                if (broadcast_idx == 0) {
+                    if (output != input)
+                        output4[offset] = input4[offset];
+                }
+                else
+                    output4[offset] = recv_channel.read<int4>(local_offset4 + offset);
+                // input4[offset] = output4[offset];
+            }
+
+            const uint64_t nLastElem = (nelem_per_shard - nFirstElem) % n_half_per_int4;
+            if (threadId < nLastElem) {
+                const uint64_t offset = local_offset + nelem_per_shard - nLastElem + threadId;
+                if (broadcast_idx == 0) {
+                    if (output != input) output[offset] = input[offset];
+                }
+                else
+                    output[offset] = recv_channel.read<half>(offset);
+            }
+            syncers[channel_id].sync(block_per_ring);
+        // }
+        // if (send_channel.src_ != NULL) {
+        if (broadcast_idx != nranks - 1) {
+            if (threadId % (blockDim.x * block_per_ring) == 0) {
+                send_channel.signal();
+                recv_channel.wait();
+            }
+            syncers[channel_id].sync(block_per_ring);
+        }
+    }
+
+}
+
+
+extern "C" __forceinline__ __device__ void
+    ringAllReduceKernel(mscclpp::SmChannelDeviceHandle* sm_input_buff_channels, 
+                        mscclpp::SmChannelDeviceHandle *sm_output_buff_channels, 
+                        mscclpp::DeviceSyncer* syncer, const int rank, 
+                        const int nranks, const uint64_t nelem_per_shard, 
+                        half* input, half* output) {
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+    // if (tid == 0 && bid == 0)
+    //     printf("rank: %d, nranks: %d, nelem_per_shard: %ld\n", rank, nranks, nelem_per_shard);
+    const int threadId = tid + bid * blockDim.x;
+    constexpr uint64_t n_half_per_int4 = sizeof(int4) / sizeof(half);
+
+    for (int reduce_idx = 0; reduce_idx < nranks - 1; reduce_idx ++) {
+        mscclpp::SmChannelDeviceHandle &channel = (reduce_idx == 0) ? sm_input_buff_channels[rank % (nranks - 1)] : sm_output_buff_channels[rank % (nranks - 1)];
+        const uint64_t local_offset = (rank + reduce_idx + 2) % nranks * nelem_per_shard;
+        const uint64_t local_offset4 = (local_offset + n_half_per_int4 - 1) / n_half_per_int4;
+        const uint64_t nFirstElem = local_offset4 * n_half_per_int4 - local_offset;
+        if (threadId < nFirstElem && threadId < nelem_per_shard) {
+            const uint64_t offset = local_offset + threadId;
+            // if (offset == 1048578) {
+            //     half tmp = channel.read<half>(offset);
+            //     printf("reduce_idx: %d, rank: %d, nranks: %d, nelem_per_shard: %ld, local_value: %f, remote_value: %f\n", reduce_idx, rank, nranks, nelem_per_shard, (float) input[offset], (float)tmp);
+            // }
+            half tmp = input[offset];
+            tmp += channel.read<half>(offset); 
+                // for rank != nranks-1, they should read from the next rank, which is exactly the rank_th
+                // element in the array; for rank = 0, it should read from the first rank
+            output[offset] = tmp;
+        }
+
+        int4* input4 = &reinterpret_cast<int4*>(input)[local_offset4];
+        int4* output4 = &reinterpret_cast<int4*>(output)[local_offset4];
+        const uint64_t nelem4 = (nelem_per_shard - nFirstElem) / n_half_per_int4;
+        for (uint64_t offset = threadId; offset < nelem4; offset += gridDim.x * blockDim.x) {
+            int4 tmp = input4[offset];
+            int4 val = channel.read<int4>(local_offset4 + offset);
+            *reinterpret_cast<__half2*>(&tmp.x) += *reinterpret_cast<__half2*>(&val.x);
+            *reinterpret_cast<__half2*>(&tmp.y) += *reinterpret_cast<__half2*>(&val.y);
+            *reinterpret_cast<__half2*>(&tmp.z) += *reinterpret_cast<__half2*>(&val.z);
+            *reinterpret_cast<__half2*>(&tmp.w) += *reinterpret_cast<__half2*>(&val.w);
+            output4[offset] = tmp;
+        }
+
+        const uint64_t nLastElem = (nelem_per_shard - nFirstElem) % n_half_per_int4;
+        if (threadId < nLastElem) {
+            const uint64_t offset = local_offset + nelem_per_shard - nLastElem + threadId;
+            half tmp = input[offset];
+            tmp += channel.read<half>(offset);
+            output[offset] = tmp;
+        }
+
+
+        syncer->sync(gridDim.x);
+        if (threadId == 0)
+        {
+            sm_output_buff_channels[(rank + nranks - 2) % (nranks - 1)].signal();
+            sm_output_buff_channels[rank % (nranks - 1)].wait();
+        }
+        syncer->sync(gridDim.x);
+    }
+
+    for (int broadcast_idx = 0; broadcast_idx < nranks - 1; broadcast_idx++) {
+        mscclpp::SmChannelDeviceHandle &channel = sm_output_buff_channels[rank % (nranks - 1)];
+        const uint64_t local_offset = (rank + broadcast_idx + 1) % nranks * nelem_per_shard;
+        const uint64_t local_offset4 = (local_offset + n_half_per_int4 - 1) / n_half_per_int4;
+        const uint64_t nFirstElem = local_offset4 * n_half_per_int4 - local_offset;
+        if (threadId < nFirstElem && threadId < nelem_per_shard) {
+            const uint64_t offset = local_offset + threadId;
+            output[offset] = channel.read<half>(offset); 
+        }
+
+        int4* input4 = &reinterpret_cast<int4*>(input)[local_offset4];
+        int4* output4 = &reinterpret_cast<int4*>(output)[local_offset4];
+        const uint64_t nelem4 = (nelem_per_shard - nFirstElem) / n_half_per_int4;
+        for (uint64_t offset = threadId; offset < nelem4; offset += gridDim.x * blockDim.x)
+            output4[offset] = channel.read<int4>(local_offset4 + offset);
+
+        const uint64_t nLastElem = (nelem_per_shard - nFirstElem) % n_half_per_int4;
+        if (threadId < nLastElem) {
+            const uint64_t offset = local_offset + nelem_per_shard - nLastElem + threadId;
+            half tmp = input[offset];
+            output[offset] = channel.read<half>(offset);
+        }
+
+        syncer->sync(gridDim.x);
+        if (threadId == 0)
+        {
+            // printf("before signal: %d\n", rank);
+            sm_output_buff_channels[(rank + nranks - 2) % (nranks - 1)].signal();
+            sm_output_buff_channels[rank % (nranks - 1)].wait();
+            // printf("after wait: %d\n", rank);
+        }
+        syncer->sync(gridDim.x);
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(1024)
     allreduceKernelEntryPoint(mscclpp::SmChannelDeviceHandle* sm_input_buff_channels,
                               mscclpp::SmChannelDeviceHandle* sm_output_buff_channels,

@@ -118,7 +118,11 @@ void test_NetRingAllGather(std::shared_ptr<mscclpp::Communicator> comm,
         input_dim2 = 1;
         output_dim2 = 1;
     }
-    int rank_prev = (rank - 1 + nranks) % nranks, rank_next = (rank + 1) % nranks;
+    // int rank_prev[2] = {(rank - 1 + nranks) % nranks, (rank - 3 + nranks) % nranks};
+    // int rank_next[2] = {(rank + 1) % nranks, (rank + 3) % nranks};
+    // int rank_prev[1] = {(rank - 1 + nranks) % nranks};
+    // int rank_next[1] = {(rank + 1) % nranks};
+    int rings_topo[24] = {0, 1, 2, 3, 4, 5, 6, 7, 0, 7, 6, 5, 4, 3, 2, 1, 0, 3, 6, 1, 4, 7, 2, 5};
 	wrapper.init(comm,
 				 connections,
 				 rank,
@@ -127,7 +131,7 @@ void test_NetRingAllGather(std::shared_ptr<mscclpp::Communicator> comm,
                     (half*)input_buff, dim1, input_dim2, PllmLayout::ROW_MAJOR},
 				 pllmTensor<half>{
                     (half*)output_buff, dim1, output_dim2, PllmLayout::ROW_MAJOR},
-                 1, &rank_next, &rank_prev);
+                 3, rings_topo);
 
 
 	MPI_Barrier(MPI_COMM_WORLD);
@@ -258,7 +262,7 @@ void test_NetAllReduce(std::shared_ptr<mscclpp::Communicator> comm,
         __fp16 expected = __fp16(0);
         for (int j = 0; j < nranks; ++j) expected += __fp16(int((i * j) % 101));
         if (host_buff[i] != expected) {
-            std::cerr << "Rank " << rank << " incorrect data at index " << i << " with value " << host_buff[i] << std::endl;
+            std::cerr << "Rank " << rank << " incorrect data at index " << i << " with value " << host_buff[i] << " and expected " << expected << std::endl;
             break;
         }
     }

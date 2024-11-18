@@ -407,6 +407,8 @@ class NetRingAllGather: public NetWrapper
     mscclpp::DeviceHandle<mscclpp::SmChannel> *smInputChannelHandlesCuda;
     mscclpp::DeviceHandle<mscclpp::SmChannel> *smOutputChannelHandlesCuda;
     int nrings;
+    int *rings_topo;
+    
 
     NetRingAllGather():NetWrapper(){}
 
@@ -414,13 +416,28 @@ class NetRingAllGather: public NetWrapper
                     std::vector<std::shared_ptr<mscclpp::Connection>> connections,
                     int rank, int nranks,
                     pllmTensor<Element> input,
-                    pllmTensor<Element> output, int nrings, int *rank_to_send, int *rank_to_recv) {
+                    pllmTensor<Element> output, int nrings, int *rings_topo) {
+        this->nrings = nrings;
+        std::vector<int> rank_to_send, rank_to_recv;
+        for (int i = 0; i < nrings; i++) {
+            for (int j = 0; j < nranks; j++) {
+                if (rings_topo[i * nranks + j] == rank) {
+                    rank_to_send.push_back(rings_topo[i * nranks + (j + 1) % nranks]);
+                    rank_to_recv.push_back(rings_topo[i * nranks + (j + nranks - 1) % nranks]);
+                    break;
+                }
+                if (j == nranks - 1)
+                    printf("rank %d not found in rings_topo in init\n", rank);
+            }
+        }
         NetWrapper::init(rank, nranks, input.ptr, output.ptr, input.size(), output.size());
-        std::vector<mscclpp::DeviceSyncer> syncers(1);
+        std::vector<mscclpp::DeviceSyncer> syncers(nrings);
         CUDA_CHECK(cudaMalloc(&syncersCuda, syncers.size() * sizeof(mscclpp::DeviceSyncer)));
         CUDA_CHECK(cudaMemcpy(syncersCuda, syncers.data(), syncers.size() * sizeof(mscclpp::DeviceSyncer), cudaMemcpyHostToDevice));
-
-        setupSmChannels(comm, connections, &smInputChannelHandlesCuda, &smOutputChannelHandlesCuda, input.ptr, output.ptr, input.size(), output.size(), nrings, rank_to_send, rank_to_recv);
+        CUDA_CHECK(cudaMalloc(&this->rings_topo, nrings * nranks * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(this->rings_topo, rings_topo, nrings * nranks * sizeof(int), cudaMemcpyHostToDevice));
+        setupSmChannels(comm, connections, &smInputChannelHandlesCuda, &smOutputChannelHandlesCuda, input.ptr, output.ptr, 
+                        input.size(), output.size(), nrings, rank_to_send, rank_to_recv);
     }
 
     void setupSmChannels(std::shared_ptr<mscclpp::Communicator> comm,
@@ -428,7 +445,7 @@ class NetRingAllGather: public NetWrapper
                          mscclpp::DeviceHandle<mscclpp::SmChannel>** smInputChannelHandlesCuda,
                          mscclpp::DeviceHandle<mscclpp::SmChannel>** smOutputChannelHandlesCuda,
                          Element* input, Element* output, size_t input_size, size_t output_size, 
-                         int nrings, int *rank_to_send, int *rank_to_recv) {
+                         int nrings, std::vector<int> rank_to_send, std::vector<int> rank_to_recv) {
         const mscclpp::TransportFlags allTransports = mscclpp::Transport::CudaIpc;
         mscclpp::RegisteredMemory inputBuffRegMem = comm->registerMemory(input, input_size * sizeof(Element), allTransports);
         mscclpp::RegisteredMemory outputBuffRegMem;
@@ -465,11 +482,11 @@ class NetRingAllGather: public NetWrapper
         }
         comm->setup();
 
-        CUDA_CHECK(cudaMalloc(smInputChannelHandlesCuda, sizeof(mscclpp::DeviceHandle<mscclpp::SmChannel>)));
+        CUDA_CHECK(cudaMalloc(smInputChannelHandlesCuda, nrings * sizeof(mscclpp::DeviceHandle<mscclpp::SmChannel>)));
         CUDA_CHECK(cudaMemcpy(*smInputChannelHandlesCuda, &smChannelHandles[nrings],
                               nrings * sizeof(mscclpp::DeviceHandle<mscclpp::SmChannel>), cudaMemcpyHostToDevice));
                               
-        CUDA_CHECK(cudaMalloc(smOutputChannelHandlesCuda, sizeof(mscclpp::DeviceHandle<mscclpp::SmChannel>)));
+        CUDA_CHECK(cudaMalloc(smOutputChannelHandlesCuda, nrings * sizeof(mscclpp::DeviceHandle<mscclpp::SmChannel>)));
         CUDA_CHECK(cudaMemcpy(*smOutputChannelHandlesCuda, &smChannelHandles[0],
                               nrings * sizeof(mscclpp::DeviceHandle<mscclpp::SmChannel>), cudaMemcpyHostToDevice));
     }
@@ -477,7 +494,8 @@ class NetRingAllGather: public NetWrapper
     void operator()(cudaStream_t stream, int nblocks, int nthreads, bool sync){
         const uint64_t nelem_per_shard = input_size / nranks;
         const uint64_t local_offset = rank * nelem_per_shard;
-        multiRingAllgatherKernel<<<nblocks, nthreads, 0, stream>>>(smInputChannelHandlesCuda, smOutputChannelHandlesCuda, syncersCuda, 1, rank, nranks, nelem_per_shard, input, output);
+        multiRingAllgatherKernel<<<nblocks, nthreads, 0, stream>>>(smInputChannelHandlesCuda, smOutputChannelHandlesCuda, 
+            syncersCuda, nrings, rank, nranks, nelem_per_shard, input, output, rings_topo);
     }
 
 

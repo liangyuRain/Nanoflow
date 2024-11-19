@@ -407,7 +407,8 @@ class NetRingAllGather: public NetWrapper
     mscclpp::DeviceHandle<mscclpp::SmChannel> *smInputChannelHandlesCuda;
     mscclpp::DeviceHandle<mscclpp::SmChannel> *smOutputChannelHandlesCuda;
     int nrings;
-    int *rings_topo;
+    int *rings_topoCuda;
+    int *idx_in_ringCuda;
     
 
     NetRingAllGather():NetWrapper(){}
@@ -419,9 +420,11 @@ class NetRingAllGather: public NetWrapper
                     pllmTensor<Element> output, int nrings, int *rings_topo) {
         this->nrings = nrings;
         std::vector<int> rank_to_send, rank_to_recv;
+        int *idx_in_ring = new int[nranks];
         for (int i = 0; i < nrings; i++) {
             for (int j = 0; j < nranks; j++) {
                 if (rings_topo[i * nranks + j] == rank) {
+                    idx_in_ring[i] = j;
                     rank_to_send.push_back(rings_topo[i * nranks + (j + 1) % nranks]);
                     rank_to_recv.push_back(rings_topo[i * nranks + (j + nranks - 1) % nranks]);
                     break;
@@ -434,8 +437,11 @@ class NetRingAllGather: public NetWrapper
         std::vector<mscclpp::DeviceSyncer> syncers(nrings);
         CUDA_CHECK(cudaMalloc(&syncersCuda, syncers.size() * sizeof(mscclpp::DeviceSyncer)));
         CUDA_CHECK(cudaMemcpy(syncersCuda, syncers.data(), syncers.size() * sizeof(mscclpp::DeviceSyncer), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMalloc(&this->rings_topo, nrings * nranks * sizeof(int)));
-        CUDA_CHECK(cudaMemcpy(this->rings_topo, rings_topo, nrings * nranks * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&this->rings_topoCuda, nrings * nranks * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(this->rings_topoCuda, rings_topo, nrings * nranks * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&idx_in_ringCuda, nranks * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(idx_in_ringCuda, idx_in_ring, nranks * sizeof(int), cudaMemcpyHostToDevice));
+        delete [] idx_in_ring;
         setupSmChannels(comm, connections, &smInputChannelHandlesCuda, &smOutputChannelHandlesCuda, input.ptr, output.ptr, 
                         input.size(), output.size(), nrings, rank_to_send, rank_to_recv);
     }
@@ -495,7 +501,7 @@ class NetRingAllGather: public NetWrapper
         const uint64_t nelem_per_shard = input_size / nranks;
         const uint64_t local_offset = rank * nelem_per_shard;
         multiRingAllgatherKernel<<<nblocks, nthreads, 0, stream>>>(smInputChannelHandlesCuda, smOutputChannelHandlesCuda, 
-            syncersCuda, nrings, rank, nranks, nelem_per_shard, input, output, rings_topo);
+            syncersCuda, nrings, rank, nranks, nelem_per_shard, input, output, rings_topoCuda, idx_in_ringCuda);
     }
 
 
@@ -503,6 +509,8 @@ class NetRingAllGather: public NetWrapper
         CUDA_CHECK(cudaFree(syncersCuda));
         CUDA_CHECK(cudaFree(smInputChannelHandlesCuda));
         CUDA_CHECK(cudaFree(smOutputChannelHandlesCuda));
+        CUDA_CHECK(cudaFree(rings_topoCuda));
+        CUDA_CHECK(cudaFree(idx_in_ringCuda));
     }
 };
 

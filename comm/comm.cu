@@ -301,7 +301,7 @@ extern "C" __global__ void
                              mscclpp::DeviceSyncer* syncers, // length = nrings
                              const int nrings, const int rank, const int nranks,
                              const uint64_t nelem_per_shard,
-                             half* input, half* output, int* rings_topo) {
+                             half* input, half* output, int* rings_topo, int* idx_in_ring) {
     
     const int tid = threadIdx.x;
     const int bid = blockIdx.x;
@@ -310,74 +310,40 @@ extern "C" __global__ void
     const int threadId = tid + (bid % block_per_ring) * blockDim.x;
     if (channel_id >= nrings) return;
     constexpr uint64_t n_half_per_int4 = sizeof(int4) / sizeof(half);
+    constexpr int n_half_per_int = sizeof(int) / sizeof(half);
     auto &&recv_channel = recv_sm_channels[channel_id];
     auto &&send_channel = send_sm_channels[channel_id];
     const int element_per_ring = nelem_per_shard / nrings;
+    const int element_alligned = (element_per_ring + n_half_per_int - 1) / n_half_per_int * n_half_per_int;
+    const int element_for_this_ring = (channel_id == nrings - 1) ? (nelem_per_shard - (nrings - 1) * element_alligned) : element_alligned;
 
-    int idx_in_ring = 0;
-    for (int i = 0; i < nranks; i++) {
-        if (rings_topo[channel_id * nranks + i] == rank) {
-            idx_in_ring = i;
-            break;
-        }
-        if (i == nranks - 1)
-            printf("Error: rank %d not found in rings_topo in init\n", rank);
+
+    if (output != input) {
+        const uint64_t local_offset = rank * nelem_per_shard + channel_id * element_alligned;
+        copy(&input[local_offset], &output[local_offset], element_for_this_ring, threadId, block_per_ring * blockDim.x);
+        syncers[channel_id].sync(block_per_ring);
     }
-    // if (threadId % (blockDim.x * block_per_ring) == 0)
-    //     printf("nrings: %d, rank: %d, channel_id: %d, idx_in_ring: %d, nelem_per_shard: %lu, element_per_ring:%d, local_input: %f, local_output: %f\n", nrings, rank, channel_id, idx_in_ring, nelem_per_shard, element_per_ring, *((float*)input + 524289), *((float*)output + 524289));
-    for (int broadcast_idx = 0; broadcast_idx < nranks; broadcast_idx++) {
-        // broadcast_idx = 0 means the local preparation iter
-
-        // if (recv_channel.dst_ != NULL) {
-        // if (broadcast_idx != 0) {
-        //     if (threadId % (blockDim.x * block_per_ring) == 0) {
-        //         recv_channel.wait();
-        //     }
-            int ring_offset = (idx_in_ring + broadcast_idx) % nranks;
-            syncers[channel_id].sync(block_per_ring);
-            const uint64_t local_offset = rings_topo[channel_id * nranks + ring_offset] * nelem_per_shard + channel_id * element_per_ring;
-            const uint64_t local_offset4 = (local_offset + n_half_per_int4 - 1) / n_half_per_int4;
-            const uint64_t nFirstElem = local_offset4 * n_half_per_int4 - local_offset;
-            if (threadId < nFirstElem && threadId < element_per_ring) {
-                const uint64_t offset = local_offset + threadId;
-                if (broadcast_idx == 0) {
-                    if (output != input) output[offset] = input[offset];
-                }
-                else
-                    output[offset] = recv_channel.read<half>(offset);
-            }
-
-            int4* input4 = &reinterpret_cast<int4*>(input)[local_offset4];
-            int4* output4 = &reinterpret_cast<int4*>(output)[local_offset4];
-            const uint64_t nelem4 = (element_per_ring - nFirstElem) / n_half_per_int4;
-            for (uint64_t offset = threadId; offset < nelem4; offset += block_per_ring * blockDim.x) {
-                if (broadcast_idx == 0) {
-                    if (output != input)
-                        output4[offset] = input4[offset];
-                }
-                else
-                    output4[offset] = recv_channel.read<int4>(local_offset4 + offset);
-            }
-
-            const uint64_t nLastElem = (element_per_ring - nFirstElem) % n_half_per_int4;
-            if (threadId < nLastElem) {
-                const uint64_t offset = local_offset + element_per_ring - nLastElem + threadId;
-                if (broadcast_idx == 0) {
-                    if (output != input) output[offset] = input[offset];
-                }
-                else
-                    output[offset] = recv_channel.read<half>(offset);
-            }
-            syncers[channel_id].sync(block_per_ring);
-        // }
-        // if (send_channel.src_ != NULL) {
-        if (broadcast_idx != nranks - 1) {
-            if (threadId == 0) {
-                send_channel.signal();
-                recv_channel.wait();
-            }
-            syncers[channel_id].sync(block_per_ring);
+    
+    for (int broadcast_idx = 0; broadcast_idx < nranks - 1; broadcast_idx++) {
+        if (threadId == 0) {
+            send_channel.signal();
+            recv_channel.wait();
         }
+        syncers[channel_id].sync(block_per_ring);
+
+
+        // int ring_offset = (idx_in_ring[channel_id] + broadcast_idx + 1) % nranks;
+        // const uint64_t local_offset = rings_topo[channel_id * nranks + ring_offset] * nelem_per_shard + channel_id * element_alligned;
+        // recv_channel.get(local_offset * sizeof(half), element_for_this_ring * sizeof(half),
+        //                 threadId, block_per_ring * blockDim.x);
+                        
+        int ring_offset = (idx_in_ring[channel_id] + broadcast_idx) % nranks;
+        const uint64_t local_offset = rings_topo[channel_id * nranks + ring_offset] * nelem_per_shard + channel_id * element_alligned;
+        send_channel.put(local_offset * sizeof(half), element_for_this_ring * sizeof(half),
+                        threadId, block_per_ring * blockDim.x);
+                            
+
+        syncers[channel_id].sync(block_per_ring);
     }
 }
 

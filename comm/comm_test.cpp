@@ -122,7 +122,7 @@ void test_NetRingAllGather(std::shared_ptr<mscclpp::Communicator> comm,
     // int rank_next[2] = {(rank + 1) % nranks, (rank + 3) % nranks};
     // int rank_prev[1] = {(rank - 1 + nranks) % nranks};
     // int rank_next[1] = {(rank + 1) % nranks};
-    int rings_topo[24] = {0, 1, 2, 3, 4, 5, 6, 7, 0, 7, 6, 5, 4, 3, 2, 1, 0, 3, 6, 1, 4, 7, 2, 5};
+    int rings_topo[40] = {0, 1, 2, 3, 4, 5, 6, 7, 0, 7, 6, 5, 4, 3, 2, 1, 0, 3, 6, 1, 4, 7, 2, 5, 0, 5, 2, 7, 4, 1, 6, 3, 0, 1, 2, 3, 4, 5, 6, 7};
 	wrapper.init(comm,
 				 connections,
 				 rank,
@@ -131,7 +131,7 @@ void test_NetRingAllGather(std::shared_ptr<mscclpp::Communicator> comm,
                     (half*)input_buff, dim1, input_dim2, PllmLayout::ROW_MAJOR},
 				 pllmTensor<half>{
                     (half*)output_buff, dim1, output_dim2, PllmLayout::ROW_MAJOR},
-                 3, rings_topo);
+                 5, rings_topo);
 
 
 	MPI_Barrier(MPI_COMM_WORLD);
@@ -170,7 +170,7 @@ void test_NetRingAllGather(std::shared_ptr<mscclpp::Communicator> comm,
 
     CUDA_CHECK(cudaFree(input_buff));
     if (input_buff != output_buff) CUDA_CHECK(cudaFree(output_buff));
-    std::cout << "Rank " << rank << " NetAllGather test ("
+    std::cout << "Rank " << rank << " NetRingAllGather test ("
               << "buff_size=" << buff_size << ",inplace=" << inplace
               << ",columnwise=" << columnwise << ") finished" << std::endl;
 }

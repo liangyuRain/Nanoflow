@@ -296,7 +296,7 @@ extern "C" __global__ void __launch_bounds__(1024)
 // For each i, (gridDim.x / nrings) number of threadblocks recv from recv_sm_channels[i] and signal to send_sm_channels[i]
 // skip recv if recv_sm_channels[i].dst_ == NULL (first GPU in ring); skip signal if send_sm_channels[i].dst_ == NULL (last GPU in ring)
 extern "C" __global__ void
-    multiRingAllgatherKernel(mscclpp::SmChannelDeviceHandle* recv_sm_channels, // length = nrings
+    multiRingAllGatherKernel(mscclpp::SmChannelDeviceHandle* recv_sm_channels, // length = nrings
                              mscclpp::SmChannelDeviceHandle* send_sm_channels, // length = nrings
                              mscclpp::DeviceSyncer* syncers, // length = nrings
                              const int nrings, const int rank, const int nranks,
@@ -332,20 +332,90 @@ extern "C" __global__ void
         syncers[channel_id].sync(block_per_ring);
 
 
-        // int ring_offset = (idx_in_ring[channel_id] + broadcast_idx + 1) % nranks;
-        // const uint64_t local_offset = rings_topo[channel_id * nranks + ring_offset] * nelem_per_shard + channel_id * element_alligned;
-        // recv_channel.get(local_offset * sizeof(half), element_for_this_ring * sizeof(half),
-        //                 threadId, block_per_ring * blockDim.x);
-                        
-        int ring_offset = (idx_in_ring[channel_id] + broadcast_idx) % nranks;
+        int ring_offset = (idx_in_ring[channel_id] + nranks - broadcast_idx - 1) % nranks;
         const uint64_t local_offset = rings_topo[channel_id * nranks + ring_offset] * nelem_per_shard + channel_id * element_alligned;
-        send_channel.put(local_offset * sizeof(half), element_for_this_ring * sizeof(half),
+        recv_channel.get(local_offset * sizeof(half), element_for_this_ring * sizeof(half),
                         threadId, block_per_ring * blockDim.x);
-                            
-
+                        
+        // int ring_offset = (idx_in_ring[channel_id] + nranks - broadcast_idx) % nranks;
+        // const uint64_t local_offset = rings_topo[channel_id * nranks + ring_offset] * nelem_per_shard + channel_id * element_alligned;
+        // send_channel.put(local_offset * sizeof(half), element_for_this_ring * sizeof(half),
+        //                 threadId, block_per_ring * blockDim.x);
         syncers[channel_id].sync(block_per_ring);
     }
 }
+
+
+extern "C" __global__ void
+    multiRingReduceScatterKernel(mscclpp::SmChannelDeviceHandle* recv_sm_channels, // length = nrings
+                             mscclpp::SmChannelDeviceHandle* send_sm_channels, // length = nrings
+                             mscclpp::DeviceSyncer* syncers, // length = nrings
+                             const int nrings, const int rank, const int nranks,
+                             const uint64_t nelem_per_shard,
+                             half* input, half* output, int* rings_topo, int* idx_in_ring) {
+   
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+    const int block_per_ring = gridDim.x / nrings;
+    const int channel_id = bid / block_per_ring;
+    const int threadId = tid + (bid % block_per_ring) * blockDim.x;
+    if (channel_id >= nrings) return;
+    constexpr uint64_t n_half_per_int4 = sizeof(int4) / sizeof(half);
+    constexpr int n_half_per_int = sizeof(int) / sizeof(half);
+    auto &&recv_channel = recv_sm_channels[channel_id];
+    auto &&send_channel = send_sm_channels[channel_id];
+    const int element_per_ring = nelem_per_shard / nrings;
+    const int element_alligned = (element_per_ring + n_half_per_int - 1) / n_half_per_int * n_half_per_int;
+    const int element_for_this_ring = (channel_id == nrings - 1) ? (nelem_per_shard - (nrings - 1) * element_alligned) : element_alligned;
+    
+    if (output != input) {
+        int ring_offset = (idx_in_ring[channel_id] + nranks - 1) % nranks;
+        const uint64_t local_offset = rings_topo[channel_id * nranks + ring_offset] * nelem_per_shard + channel_id * element_alligned;
+        copy(&input[local_offset], &output[local_offset], element_for_this_ring, threadId, block_per_ring * blockDim.x);
+        syncers[channel_id].sync(block_per_ring);
+    }
+
+    for (int reduce_idx = 0; reduce_idx < nranks - 1; reduce_idx ++) {
+        if (threadId == 0) {
+            send_channel.signal();
+            recv_channel.wait();
+        }
+        syncers[channel_id].sync(block_per_ring);
+        int ring_offset = (idx_in_ring[channel_id] + nranks - reduce_idx - 2) % nranks;
+        const uint64_t local_offset = rings_topo[channel_id * nranks + ring_offset] * nelem_per_shard + channel_id * element_alligned;
+        const uint64_t local_offset4 = (local_offset + n_half_per_int4 - 1) / n_half_per_int4;
+        const uint64_t nFirstElem = local_offset4 * n_half_per_int4 - local_offset;
+        if (threadId < nFirstElem && threadId < element_for_this_ring) {
+            const uint64_t offset = local_offset + threadId;
+            half tmp = input[offset];
+            tmp += recv_channel.read<half>(offset); 
+            output[offset] = tmp;
+        }
+
+        int4* input4 = &reinterpret_cast<int4*>(input)[local_offset4];
+        int4* output4 = &reinterpret_cast<int4*>(output)[local_offset4];
+        const uint64_t nelem4 = (element_for_this_ring - nFirstElem) / n_half_per_int4;
+        for (uint64_t offset = threadId; offset < nelem4; offset += block_per_ring * blockDim.x) {
+            int4 tmp = input4[offset];
+            int4 val = recv_channel.read<int4>(local_offset4 + offset);
+            *reinterpret_cast<__half2*>(&tmp.x) += *reinterpret_cast<__half2*>(&val.x);
+            *reinterpret_cast<__half2*>(&tmp.y) += *reinterpret_cast<__half2*>(&val.y);
+            *reinterpret_cast<__half2*>(&tmp.z) += *reinterpret_cast<__half2*>(&val.z);
+            *reinterpret_cast<__half2*>(&tmp.w) += *reinterpret_cast<__half2*>(&val.w);
+            output4[offset] = tmp;
+        }
+
+        const uint64_t nLastElem = (element_for_this_ring - nFirstElem) % n_half_per_int4;
+        if (threadId < nLastElem) {
+            const uint64_t offset = local_offset + element_for_this_ring - nLastElem + threadId;
+            half tmp = input[offset];
+            tmp += recv_channel.read<half>(offset);
+            output[offset] = tmp;
+        }
+        syncers[channel_id].sync(block_per_ring);
+    }
+}
+
 
 
 extern "C" __forceinline__ __device__ void
